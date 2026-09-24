@@ -1,3 +1,5 @@
+> **Jetson AGX Thor:** use `./start-thor.sh` for conservative initial settings. Stop with `./stop.sh`. See [Thor setup and validation](docs/thor.md) and the [fork change record](docs/thor-port.md).
+
 <h1 align="center">Qwen3.8-Flash-Next on ONE DGX Spark (TP=1)</h1>
 
 <p align="center">

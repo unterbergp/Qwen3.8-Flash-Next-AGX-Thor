@@ -1,9 +1,47 @@
 # Changelog
 
 Notable changes to this deployment kit. The repository is not versioned; entries
-are grouped by date, newest first. Every measurement named here was taken on the
-one DGX Spark this repo is written for — treat them as that host's numbers, not
-as promises.
+are grouped by date, newest first. Historical entries describe the upstream DGX
+Spark deployment. The Thor port is identified separately below; measurements
+belong to the named hardware and configuration, not to every supported system.
+
+## 2026-09-24 — Jetson AGX Thor port
+
+Ported from upstream `6b5086458023474a7809ea30e1bcf42f03dcd75f`.
+See the [fork change record](docs/thor-port.md) for the file-by-file rationale,
+tested image digest, validation limits and maintenance guidance, and the
+[Thor runbook](docs/thor.md) for operation.
+
+### Changed
+
+- Added `start-thor.sh`: a native 262,144-token, single-sequence, eager profile with Marlin MoE,
+  Triton GDN, BF16 KV, MTP disabled and a Thor runtime-overhead estimate of
+  14 GiB. Start with this wrapper; stop with the existing `stop.sh`.
+- Restored native context after initial 32K bring-up and raised the KV target
+  from 4 to 8 GiB. Full-context Thor validation is still pending.
+- Added Thor detection, explicit NVIDIA runtime selection, backend overrides
+  and a GPU/image preflight to `start.sh`. Suppressed unvalidated Spark sysctl
+  recommendations on Thor.
+- Routed SM110 QSA selection through persistent top-k after the cooperative
+  cluster kernel failed. Preserved the existing SM12x dispatch.
+- Fixed first-launch archive pruning: an empty archive no longer aborts startup.
+- Made the smoke test's speed floor configurable with `MIN_DECODE_TPS`;
+  the default remains 15, while zero reports speed without enforcing a floor.
+- Added CPU profile/archive tests, GPU MoE/QSA regressions and Thor documentation.
+
+### Measured on Thor
+
+- SM110, Jetson Linux R38.2.2, CUDA 13.0, approximately 122.8 GiB shared RAM.
+- The stock Mia NVFP4 checkpoint reached readiness in approximately 7 minutes
+  with 4.89 GiB KV cache and a 32,768-token served context.
+- Text, parsed tool calls, vision, health and metrics passed. Final functional
+  smoke result: 7 passed, 0 failed, one warning with the speed floor explicitly
+  disabled. Throughput was 5.8–6.1 tokens/s, below the original Spark threshold.
+- Temperature-zero output was not consistently deterministic. Larger contexts,
+  MTP, graphs, concurrency and sustained operation remain unvalidated on Thor.
+- The host-provided cleanup script recovered available memory without rebooting;
+  it is not bundled or invoked automatically. Standalone GPU tests should run
+  with serving stopped; a concurrent Marlin probe stalled.
 
 ## 2026-09-18
 

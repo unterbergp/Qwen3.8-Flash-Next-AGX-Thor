@@ -6,6 +6,7 @@
 # Usage:
 #   ./scripts/smoke-test.sh                      # localhost:8888, no auth
 #   PORT=9000 API_KEY=xyz ./scripts/smoke-test.sh
+#   MIN_DECODE_TPS=0 ./scripts/smoke-test.sh  # report speed without a performance gate
 #
 # Reads .env (repo-relative) for API_KEY/PORT/SERVED_MODEL_NAME when the
 # caller did not set them, matching start.sh's precedence: environment wins.
@@ -19,6 +20,7 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 _CLI_API_KEY="${API_KEY:-}"
 _CLI_PORT="${PORT:-}"
 _CLI_SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
+_CLI_MIN_DECODE_TPS="${MIN_DECODE_TPS:-}"
 if [[ -f "$REPO_DIR/.env" ]]; then
     # shellcheck source=.env
     source "$REPO_DIR/.env"
@@ -27,6 +29,13 @@ fi
 [[ -n "$_CLI_PORT" ]] && PORT="$_CLI_PORT"
 [[ -n "$_CLI_SERVED_MODEL_NAME" ]] && SERVED_MODEL_NAME="$_CLI_SERVED_MODEL_NAME"
 
+# The 15 tok/s baseline was measured on Spark; Thor eager mode is slower.
+# Set 0 to report throughput without asserting a performance target.
+MIN_DECODE_TPS="${_CLI_MIN_DECODE_TPS:-${MIN_DECODE_TPS:-15}}"
+if ! [[ "$MIN_DECODE_TPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "MIN_DECODE_TPS must be a non-negative number" >&2
+    exit 1
+fi
 PORT="${PORT:-8888}"
 MODEL="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 EXPECT_LEN="${EXPECT_LEN:-}"        # set to 262144 or 524288 to assert context
@@ -88,7 +97,7 @@ else
     # top-k kernel is non-deterministic (drops candidates, upstream
     # vllm#51782). Flaky in both directions — a pass does not prove the
     # kernel is deterministic either.
-    note "outputs differ at temperature 0 (known GB10 QSA top-k non-determinism — see issue #7)"
+    note "outputs differ at temperature 0 (this stack does not guarantee deterministic output — see issue #7)"
 fi
 
 echo "== 5. decode speed (real answer, not ignore_eos) =="
@@ -107,7 +116,13 @@ print(d["usage"]["completion_tokens"])' 2>/dev/null)
 if [[ -n "$RATE" && "$RATE" -gt 0 ]]; then
     TPS=$(python3 -c "print(f'{$RATE / ($T1 - $T0):.1f}')")
     echo "  completion_tokens=$RATE in $(python3 -c "print(f'{$T1-$T0:.1f}')")s -> ${TPS} tok/s"
-    python3 -c "import sys; sys.exit(0 if $RATE / ($T1 - $T0) >= 15 else 1)"         && ok "decode ${TPS} tok/s (>=15)" || bad "decode ${TPS} tok/s — suspiciously slow"
+    if python3 -c "import sys; sys.exit(0 if $MIN_DECODE_TPS == 0 else 1)"; then
+        note "decode ${TPS} tok/s; performance floor disabled (MIN_DECODE_TPS=0)"
+    elif python3 -c "import sys; sys.exit(0 if $RATE / ($T1 - $T0) >= $MIN_DECODE_TPS else 1)"; then
+        ok "decode ${TPS} tok/s (>=${MIN_DECODE_TPS})"
+    else
+        bad "decode ${TPS} tok/s (below MIN_DECODE_TPS=${MIN_DECODE_TPS})"
+    fi
 else
     bad "no completion tokens in response"
 fi

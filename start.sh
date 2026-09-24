@@ -112,13 +112,13 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     MEMWATCH_MIN_GIB MEMWATCH_MIN_FREE_GIB MEMWATCH_FREE_GATE_GIB MEMWATCH_GRACE
                     OVERHEAD_GIB PLE_GIB CONTAINER_MEM_GIB KV_CACHE_MEMORY
                     MAMBA_SSM_CACHE_DTYPE
-                    IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN
+                    IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN DOCKER_GPU_RUNTIME
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
                     MTP_DRAFT_VOCAB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE MOE_BACKEND)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -157,6 +157,19 @@ fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 PORT="${_CLI_PORT:-${PORT:-8888}}"            # 8888 is safe only while comfy-h3.service is disabled (it watches this port)
 IMAGE="${IMAGE:?IMAGE not set in .env}"
+# Jetson needs the NVIDIA runtime explicitly (the daemon may default to runc).
+DOCKER_GPU_RUNTIME="${DOCKER_GPU_RUNTIME:-auto}"
+PLATFORM_LABEL="DGX Spark"
+if [[ -f /etc/nv_tegra_release ]] && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qi thor; then
+    PLATFORM_LABEL="Jetson AGX Thor"
+    [[ "$DOCKER_GPU_RUNTIME" != auto ]] || DOCKER_GPU_RUNTIME=nvidia
+fi
+[[ "$DOCKER_GPU_RUNTIME" != auto ]] || DOCKER_GPU_RUNTIME=default
+case "$DOCKER_GPU_RUNTIME" in
+    nvidia) DOCKER_GPU_ARGS="--runtime=nvidia --gpus all" ;;
+    default) DOCKER_GPU_ARGS="--gpus all" ;;
+    *) err "DOCKER_GPU_RUNTIME must be auto, nvidia, or default" ;;
+esac
 # Interface the API binds to. Default is every interface: the box is a
 # server, and the no-key WARN below is the guardrail. Set BIND=127.0.0.1 for
 # loopback-only (ssh-tunnel access). See the README migration note.
@@ -307,6 +320,8 @@ VLLM_MOE_DET_FINALIZE="${VLLM_MOE_DET_FINALIZE:-}"
 # for one release (so the knob exists and README documents the stall); flip to
 # triton in a later release only after a soak, so there is a bisectable state.
 GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-}"
+MOE_BACKEND="${MOE_BACKEND:-}"
+[[ -z "$MOE_BACKEND" || "$MOE_BACKEND" =~ ^[a-z0-9_]+$ ]] || err "Invalid MOE_BACKEND"
 # disable_eagle_block_drop (plan 2.4 / review §6.1): speculative-config lever
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
@@ -588,7 +603,7 @@ ok "  budget fits."
 # with; read its header before applying (they shift MemAvailable accounting).
 VM_MIN_FREE_KB=$(cat /proc/sys/vm/min_free_kbytes 2>/dev/null || echo 0)
 VM_WSF=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null || echo 0)
-if (( VM_MIN_FREE_KB < 1048576 || VM_WSF < 100 )); then
+if [[ "$PLATFORM_LABEL" == "DGX Spark" ]] && (( VM_MIN_FREE_KB < 1048576 || VM_WSF < 100 )); then
     warn "  kernel VM tunables at defaults (vm.min_free_kbytes=${VM_MIN_FREE_KB}, vm.watermark_scale_factor=${VM_WSF}): no free-page reserve for the NVIDIA driver. Not applied by this script (sudo). See files/sysctl-spark3.conf, then: sudo sysctl -p files/sysctl-spark3.conf"
 fi
 
@@ -620,6 +635,15 @@ info "=== Step 4: Prepare patches ==="
 if ! docker image inspect "$IMAGE" &>/dev/null; then
     info "Pulling $IMAGE ..."
     docker pull "$IMAGE"
+fi
+
+# Fail before loading ~99 GiB when a replacement image lacks Thor kernels.
+if $DO_LAUNCH && [[ "$PLATFORM_LABEL" == "Jetson AGX Thor" ]]; then
+    info "Checking Thor CUDA and model support in $IMAGE ..."
+    docker run --rm --runtime=nvidia --gpus all \
+        -v "$SCRIPT_DIR/scripts/check_thor.py:/check_thor.py:ro" \
+        --entrypoint python3 "$IMAGE" /check_thor.py \
+        || err "Image failed the Thor compatibility check; see docs/thor.md."
 fi
 
 extract() {  # <path-in-image> <dest>
@@ -952,6 +976,7 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     fi
     VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s%s%s}'" "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED" "$_SPEC_ARGMAX")")
 fi
+[[ -z "$MOE_BACKEND" ]] || VLLM_ARGS+=("--moe-backend" "$MOE_BACKEND")
 _CG_SIZES="$CUDAGRAPH_CAPTURE_SIZES"
 if [[ "$_CG_SIZES" == "auto" ]]; then
     # Every verify-batch width the scheduler can actually build: (1+K(S))*S for
@@ -1005,10 +1030,11 @@ if [[ "$BIND" != "127.0.0.1" && "$BIND" != "::1" && "$BIND" != "localhost" ]]; t
 fi
 
 info ""
-info "Config (single Spark, TP=1):"
+info "Config ($PLATFORM_LABEL, TP=1):"
 info "  Model:      $MODEL_ID"
 info "  Ablit:      $ABLIT$( [[ "$ABLIT" == "1" ]] && echo ' (gated Keys o_proj L15-47)' )"
 info "  Image:      $IMAGE"
+info "  MoE:        ${MOE_BACKEND:-auto}"
 if [[ -n "$YARN_FACTOR" ]]; then
 info "  Context:    $MAX_MODEL_LEN tokens (YaRN factor $YARN_FACTOR over native $NATIVE_MAX_MODEL_LEN)"
 else
@@ -1028,7 +1054,7 @@ cat > "$LAUNCH_SCRIPT" <<LAUNCH_EOF
 #!/bin/bash
 docker run \\
     -d --name $CONTAINER_NAME \\
-    --gpus all --network host --ipc host \\
+    $DOCKER_GPU_ARGS --network host --ipc host \\
     --cap-add SYS_NICE --cap-add SYS_PTRACE --ulimit memlock=-1 --ulimit stack=67108864 \\
     --memory ${CONTAINER_MEM_GIB}g --memory-swap ${CONTAINER_MEM_GIB}g \\
     --log-opt max-size=50m --log-opt max-file=3 \\
@@ -1095,10 +1121,17 @@ ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
 # -probe-latency.log) members. 24/7 relauches run on a scheduled cadence, so
 # without a prune the archive grows forever and threatens the checkpoint
 # disk cache.
-ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
-    _set="${f%-container.log}"
-    rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
-done
+python3 - "$SCRIPT_DIR/logs/archive" <<'PRUNE_PY'
+from pathlib import Path
+import sys
+archive = Path(sys.argv[1])
+logs = sorted(archive.glob("*-container.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+for log in logs[20:]:
+    prefix = log.name.removesuffix("-container.log")
+    for suffix in ("container", "memwatch", "probe-latency", "timeout"):
+        (archive / f"{prefix}-{suffix}.log").unlink(missing_ok=True)
+PRUNE_PY
+
 if docker inspect "$CONTAINER_NAME" &>/dev/null; then
     # The old container is removed below; keep its log for the post-mortem first.
     docker logs --tail 3000 "$CONTAINER_NAME" > "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-container.log" 2>&1 || true
@@ -1161,7 +1194,7 @@ while true; do
     if [[ "$CODE" == "200" ]]; then
         kill $LOGPID 2>/dev/null || true
         echo ""
-        ok "vLLM ready on port $PORT (TP=1, single Spark) after ${ELAPSED}s."
+        ok "vLLM ready on port $PORT (TP=1, $PLATFORM_LABEL) after ${ELAPSED}s."
         docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "GPU KV cache size|Available KV cache|Maximum concurrency" | tail -3 || true
         # Resuming after a manual stop clears the manual stopping flag: the
         # operator's own relaunch IS the resume (stop.sh's header promise).

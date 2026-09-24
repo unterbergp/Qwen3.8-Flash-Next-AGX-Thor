@@ -21,9 +21,10 @@ quantising keys perturbs which blocks the indexer selects, not merely the
 attention output. Treat it as a capacity trade, not a free win, and
 re-validate quality on your own workload.
 
-Inert unless --kv-cache-dtype is fp8: KV_QUANT_MODE is a tl.constexpr, so the
+The FP8 changes are inert unless --kv-cache-dtype is fp8: KV_QUANT_MODE is a tl.constexpr, so the
 cast/scale branches are eliminated at Triton compile time and the BF16 path
-emits the same code as before.
+emits the same code as before. Independently of cache dtype, SM110 (Thor)
+uses persistent_topk because this image's cooperative cluster launch fails there.
 
 Inputs:  files/qsa_ops_patched.py.orig     (nvidia/ops/qsa.py from the image)
          files/qsa_nvidia_patched.py.orig  (nvidia/qsa.py from the image)
@@ -104,6 +105,13 @@ def _qsa_as_fp8(cache, kv_quant_mode, what):
 patch(
     "qsa_ops_patched.py",
     [
+        # Thor SM110 cannot launch this image's cooperative cluster top-k.
+        # Use persistent_topk, as the upstream dispatch already does for SM12x.
+        (
+            "            and not current_platform.is_device_capability_family(120)\n",
+            "            and not current_platform.is_device_capability_family(120)\n"
+            "            and not current_platform.is_device_capability_family(110)\n",
+        ),
         # -- local cache/scale helpers ---------------------------------------
         (
             "\n\ndef _validate_mqa(q: torch.Tensor) -> None:",
