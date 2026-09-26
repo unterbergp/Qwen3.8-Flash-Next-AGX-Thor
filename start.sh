@@ -114,7 +114,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     MAMBA_SSM_CACHE_DTYPE
                     IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN DOCKER_GPU_RUNTIME
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
-                    MTP_DRAFT_VOCAB
+                    MTP_DRAFT_VOCAB VLLM_USE_V2_MODEL_RUNNER
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
@@ -680,6 +680,15 @@ extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
 
+THOR_RUNNER_MOUNT=""
+if [[ "$PLATFORM_LABEL" == "Jetson AGX Thor" ]]; then
+    THOR_RUNNER_PKG="$VLLM_PKG/v1/worker/gpu/model_runner.py"
+    PATCHED_THOR_RUNNER="$SCRIPT_DIR/files/thor_model_runner.py"
+    extract "$THOR_RUNNER_PKG" "$PATCHED_THOR_RUNNER.orig"
+    python3 "$SCRIPT_DIR/files/patch_thor_runner.py"
+    THOR_RUNNER_MOUNT="-v $PATCHED_THOR_RUNNER:$THOR_RUNNER_PKG:ro"
+fi
+
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
 extract "$VLLM_PKG/model_executor/layers/ple_offload_layer.py" "$OFFLOAD_DIR/orig/ple_offload_layer.py"
@@ -987,6 +996,7 @@ if [[ "$_CG_SIZES" == "auto" ]]; then
         _AUTO_MAX_SEQS="$MAX_NUM_SEQS" \
         _AUTO_K="$MTP_NUM_SPECULATIVE_TOKENS" \
         _AUTO_SCHED="$MTP_K_SCHEDULE" \
+        _AUTO_PLATFORM="$PLATFORM_LABEL" \
         python3 -c '
 import os
 max_seqs = int(os.environ["_AUTO_MAX_SEQS"])
@@ -996,8 +1006,11 @@ for part in filter(None, os.environ["_AUTO_SCHED"].strip().split(",")):
     lo, hi, k = (int(x) for x in part.split(":"))
     for s in range(lo, min(hi, max_seqs) + 1):
         k_of.setdefault(s, min(k, k_default))
-print(",".join(str(x) for x in sorted(
-    {(1 + k_of.get(s, k_default)) * s for s in range(1, max_seqs + 1)})))
+sizes = {(1 + k_of.get(s, k_default)) * s for s in range(1, max_seqs + 1)}
+# MRV2 draft decode consumes one token per request, independently of K.
+if os.environ["_AUTO_PLATFORM"] == "Jetson AGX Thor" and k_default > 1:
+    sizes.update(range(1, max_seqs + 1))
+print(",".join(str(x) for x in sorted(sizes)))
 '
     )
 fi
@@ -1085,6 +1098,8 @@ docker run \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
     $EXTRA_DOCKER_ARGS \\
+    $THOR_RUNNER_MOUNT \\
+    ${VLLM_USE_V2_MODEL_RUNNER:+-e VLLM_USE_V2_MODEL_RUNNER=$VLLM_USE_V2_MODEL_RUNNER} \\
     $IMAGE \\
     $MODEL_ID \\
     $VLLM_ARGS_STR \\

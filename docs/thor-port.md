@@ -5,6 +5,13 @@ Qwen3.8 Flash Next deployment on one Jetson AGX Thor. It is the maintainer-facin
 companion to the [Thor runbook](thor.md), which covers starting, stopping,
 cleanup and test commands.
 
+The settings and limitations below describe the original bring-up. The
+2026-09-26 follow-up enables full decode CUDA graphs and MTP in the Thor
+wrapper. It adds `files/patch_thor_runner.py` for dummy inputs and early
+multimodal preparation, `tests/test_thor_runner.py` for startup regressions, and
+`bench/thor-decode.py` for measured throughput and draft acceptance. See the
+runbook for current settings, measurements and the startup-workaround limits.
+
 The port adds an opt-in Thor profile and two GPU kernel compatibility fixes.
 It reuses the upstream model image, checkpoint, PLE offload implementation,
 download procedure and shutdown script. No container rebuild was required.
@@ -92,7 +99,7 @@ excluding the SM12x family. The patch also excludes SM110, directing Thor to
 previous predicates. The edit lives in the patch generator, not only in the
 ignored generated Python file, so subsequent launches reproduce it.
 
-### Thor defaults and their intent
+### Initial Thor defaults and their intent
 
 Explicit nonempty environment overrides take precedence over these wrapper
 defaults. The wrapper exports them before calling `start.sh`, whose environment
@@ -133,7 +140,7 @@ Testing on 2026-09-24 established:
   parsed tool calls, image recognition of the supplied fixture and metrics worked.
 - The final functional smoke run returned **7 passed, 0 failed, 1 warning**.
   It used `MIN_DECODE_TPS=0`; the warning explicitly reports the disabled speed
-  floor. The original 15 tokens/s gate failed and has not been claimed as passing.
+  floor. The original 15 tokens/s gate failed during that bring-up.
 - Two 400-token requests measured **5.8–6.1 tokens/s**, including request overhead.
 - Temperature-zero responses differed in one run and matched in another.
   Determinism is not guaranteed.
@@ -146,11 +153,11 @@ container. It was stopped; subsequent API generation succeeded. Run standalone
 GPU regressions with serving stopped. The isolated passing Marlin result is
 not a claim that the concurrent probe passed.
 
-The port has not validated video requests, larger contexts, MTP, CUDA graphs,
+The initial port did not validate video requests, larger contexts, MTP, CUDA graphs,
 multiple concurrent requests, sustained load/soak operation, other checkpoints,
 or supervised systemd restarts on Thor. Spark behavior was preserved in the
 relevant dispatch/defaults, but the changes were not rerun on a physical Spark.
-See the [runbook](thor.md#validation-on-this-machine) for reproduction commands.
+See the [runbook](thor.md#reproduce-the-current-checks) for reproduction commands.
 
 ## Host cleanup and fork contents
 

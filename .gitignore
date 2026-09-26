@@ -126,3 +126,6 @@
 !/tests/test_thor_moe.py
 !/tests/test_thor_qsa.py
 !/docs/thor-port.md
+!/bench/thor-decode.py
+!/files/patch_thor_runner.py
+!/tests/test_thor_runner.py

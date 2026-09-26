@@ -33,19 +33,50 @@ class ThorProfileTests(unittest.TestCase):
         self.assertEqual(env["MOE_BACKEND"], "marlin")
         self.assertEqual(env["MAX_MODEL_LEN"], "262144")
         self.assertEqual(env["KV_TARGET_GIB"], "8")
-        self.assertEqual(env["MTP_NUM_SPECULATIVE_TOKENS"], "0")
-        self.assertEqual(env["CUDAGRAPH_MODE"], "NONE")
+        self.assertEqual(env["MTP_NUM_SPECULATIVE_TOKENS"], "3")
+        self.assertEqual(env["CUDAGRAPH_MODE"], "FULL_DECODE_ONLY")
+        self.assertEqual(env["CUDAGRAPH_CAPTURE_SIZES"], "auto")
+        self.assertEqual(env["VLLM_USE_V2_MODEL_RUNNER"], "1")
         self.assertEqual(env["KV_CACHE_DTYPE"], "auto")
-        self.assertEqual(env["OVERHEAD_GIB"], "14")
+        self.assertEqual(env["OVERHEAD_GIB"], "16")
         self.assertNotIn("HF_TOKEN", env)
         self.assertNotIn("IMAGE", env)
 
     def test_explicit_environment_wins(self):
-        overrides = {"MAX_MODEL_LEN": "65536", "MTP_NUM_SPECULATIVE_TOKENS": "3",
+        overrides = {"MAX_MODEL_LEN": "65536", "MTP_NUM_SPECULATIVE_TOKENS": "0",
+                     "CUDAGRAPH_MODE": "NONE", "CUDAGRAPH_CAPTURE_SIZES": "1",
+                     "VLLM_USE_V2_MODEL_RUNNER": "0",
                      "MOE_BACKEND": "auto", "IMAGE": "local/test", "PORT": "9000"}
         env, _ = self.run_profile(overrides)
         for key, value in overrides.items():
             self.assertEqual(env[key], value)
+        self.assertEqual(env["OVERHEAD_GIB"], "14")
+
+    def test_explicit_overhead_wins_with_mtp(self):
+        env, _ = self.run_profile({"OVERHEAD_GIB": "18"})
+        self.assertEqual(env["OVERHEAD_GIB"], "18")
+
+
+class GraphCaptureSizesTests(unittest.TestCase):
+    def sizes(self, platform, sequences, depth, schedule=""):
+        source = (ROOT / "start.sh").read_text()
+        code = source.split("import os\nmax_seqs =", 1)[1].split("\n'", 1)[0]
+        code = "import os\nmax_seqs =" + code
+        result = subprocess.run(
+            ["python3", "-c", code], capture_output=True, text=True, check=True,
+            env={**os.environ, "_AUTO_PLATFORM": platform,
+                 "_AUTO_MAX_SEQS": str(sequences), "_AUTO_K": str(depth),
+                 "_AUTO_SCHED": schedule},
+        )
+        return result.stdout.strip()
+
+    def test_thor_captures_target_and_draft_decode(self):
+        self.assertEqual(self.sizes("Jetson AGX Thor", 1, 3), "1,4")
+        self.assertEqual(self.sizes("Jetson AGX Thor", 2, 3), "1,2,4,8")
+
+    def test_non_speculative_and_spark_sizes(self):
+        self.assertEqual(self.sizes("Jetson AGX Thor", 1, 0), "1")
+        self.assertEqual(self.sizes("DGX Spark", 4, 3), "4,8,12,16")
 
 
 class ArchivePruningTests(unittest.TestCase):

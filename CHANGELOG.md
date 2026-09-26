@@ -5,6 +5,27 @@ are grouped by date, newest first. Historical entries describe the upstream DGX
 Spark deployment. The Thor port is identified separately below; measurements
 belong to the named hardware and configuration, not to every supported system.
 
+## 2026-09-26 — Thor MTP and CUDA graphs
+
+- Enable three-token MTP and full decode CUDA graphs in `start-thor.sh`, with
+  the V2 runner pinned for target and draft. Automatic capture sizes include
+  draft decode (`1,4` at the single-sequence default).
+- Raise the MTP runtime-overhead estimate to 16 GiB while retaining native
+  262,144-token context, BF16 KV, Marlin MoE, Triton GDN and the host reserve.
+- Add a Thor-only runner patch for synthetic dummy inputs and startup ordering:
+  prepare multimodal profiling inputs before model allocation, keep encoder
+  execution in memory profiling, and synchronize model initialization.
+  This is a local workaround for observed startup state corruption; the faulty
+  writer has not been identified. No per-token synchronization is added.
+- Add an isolated prose/code benchmark with speculative acceptance checks and
+  regression tests for the launch profile, graph sizes and runner patch.
+  Spark launch behavior is preserved.
+- Two clean startups passed all eight smoke checks and six draft-acceptance
+  measurements each. Median 400-token throughput was 36.3–36.7 tokens/s for
+  prose and 59.0–59.5 for code, versus 28.35/28.15 with graphs alone. A 7K-token
+  cached conversation and a thinking-budget check also passed.
+- See the [Thor runbook](docs/thor.md) for commands, measurements and limits.
+
 ## 2026-09-24 — Jetson AGX Thor port
 
 Ported from upstream `6b5086458023474a7809ea30e1bcf42f03dcd75f`.
