@@ -1,36 +1,133 @@
-> **Jetson AGX Thor:** use `./start-thor.sh` for the Thor profile with full decode CUDA graphs and MTP. Stop with `./stop.sh`. See [Thor setup and validation](docs/thor.md) and the [fork change record](docs/thor-port.md).
+<h1 align="center">Qwen3.8-Flash-Next on Jetson AGX Thor (TP=1)</h1>
 
-<h1 align="center">Qwen3.8-Flash-Next on ONE DGX Spark (TP=1)</h1>
+> **THIS FORK is for NVIDIA Jetson AGX Thor.** The repository name retains its
+> Spark origin; the Thor entry point is `./start-thor.sh`. For the main DGX Spark
+> version, use [MiaAI Lab’s upstream repository](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark).
 
 <p align="center">
-  <sub>by <a href="https://x.com/MiaAI_lab">Mia'a AI Lab</a></sub>
+  <sub>Based on the original DGX Spark recipe by <a href="https://x.com/MiaAI_lab">MiaAI Lab</a>; adapted in this fork for AGX Thor.</sub>
   <br><br>
   <a href="https://github.com/sponsors/MiaAI-Lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Sponsor%20me%20on%20GitHub-181717?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor me on GitHub" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
   <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
 </p>
 
-Self-contained recipe for serving the `Mia-AiLab/Qwen3.8-Flash-Next-NVFP4`
-checkpoint (99 GiB) from a single DGX Spark's 121 GiB unified memory, via vLLM
-with the PLE table offloaded and memory-mapped. This is a **vision-language**
-model: text, images and video all work out of the box (see below). Nothing here depends on the
-2-node files it was derived from.
+This fork serves the `Mia-AiLab/Qwen3.8-Flash-Next-NVFP4` checkpoint
+(approximately 99 GiB) on **one Jetson AGX Thor**, using vLLM and the upstream
+memory-mapped PLE offload. It reuses MiaAI Lab's checkpoint, model-specific
+container image, download tooling and memory protections. No container rebuild
+was needed for the tested port.
 
-```
-cp .env.sample .env        # edit IMAGE / HF_TOKEN if needed
+Start with the [Thor runbook](docs/thor.md) for setup and validation, or the
+[fork change record](docs/thor-port.md) for the original bring-up and patch
+rationale. The port is based on upstream commit `6b5086458023474a7809ea30e1bcf42f03dcd75f`.
+
+## Quick start on AGX Thor
+
+Tested on Thor SM110 with approximately 122.8 GiB usable shared RAM, Ubuntu
+24.04 / Jetson Linux R38.2.2, driver 580.00 and CUDA 13.0. Use the model-specific
+`vllm/vllm-openai:qwen38-flash-next` image from `.env.sample`; the patches depend
+on its Qwen implementation and internal Python layout. The tested image digest
+and package versions are recorded in the [fork change record](docs/thor-port.md#upstream-baseline-and-tested-environment).
+
+```bash
+cp .env.sample .env        # first setup only; edit credentials / API settings
 ./download.sh              # fetch the ~99 GiB checkpoint (resumable, sha256-verified)
-./start.sh                 # ~10-12 min to /health; serves on :8888
-./stop.sh                  # container + watchdog, graceful
+./start-thor.sh             # Thor profile; serves on :8888
+./stop.sh                   # container + watchdog, graceful
 ```
 
-`start.sh` never downloads anything — it resolves the checkpoint from the local
-Hugging Face cache and fails fast if it is absent. Budget ~130 GiB of free disk:
-99 GiB for the checkpoint plus the ~27 GiB packed PLE table built on first launch.
+Allow approximately 130 GiB of free disk for the checkpoint and the ~27 GiB
+packed PLE table built on first launch, plus space for the container image and
+caches. The launcher requires a locally downloaded checkpoint.
 
-`./start.sh --no-launch` prints the derived memory budget and the docker
-command without running anything. `./stop.sh` sends SIGTERM and waits up to
-`STOP_TIMEOUT` (default 30 s) so vLLM can unlink its POSIX shared memory —
-the container runs with `--ipc host`, so segments it leaves behind leak onto
-the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
+`start-thor.sh` applies Thor defaults over the Spark values in `.env`, then
+calls the shared `start.sh` launcher. Explicit environment overrides take
+precedence, for example `MAX_MODEL_LEN=65536 ./start-thor.sh`. Image, model,
+credentials, port, binding and host reserves still come from `.env`. Do not
+export the entire Spark `.env` before launching: those exported settings would
+override the Thor profile.
+
+`./start-thor.sh --no-launch` prepares patches and writes `.last_launch.sh`
+without starting serving or running GPU preflight. It can still pull the image
+or build the packed PLE table. `./stop.sh` allows graceful cleanup of shared
+memory; `./stop.sh --force` skips the wait.
+
+## What changed to make it work on Thor
+
+- **Jetson runtime and preflight:** detect Thor and select
+  `--runtime=nvidia --gpus all`. Before loading the weights, check SM110,
+  CUDA 13+, BF16 matrix multiplication, Triton compilation, persistent top-k,
+  model files and reported Marlin support.
+- **Marlin NVFP4 MoE:** select `--moe-backend marlin` because the image's
+  automatically selected CUTLASS path failed during warmup on Thor. This is a
+  compatibility choice for the tested software stack.
+- **QSA top-k dispatch:** exclude SM110 from the cooperative top-k kernel,
+  which failed with a cluster-configuration error. Thor uses persistent top-k;
+  the existing Spark dispatch is preserved.
+- **CUDA graphs and MTP startup:** patch the V2 model runner to use synthetic
+  inputs during dummy runs, prepare multimodal profile inputs before model
+  allocation, and synchronize MTP startup work. Pin V2 for both target and
+  draft runners and capture the required decode sizes (`1,4` at MTP 3 with
+  one sequence). This addresses observed invalid PLE indexing and zero draft
+  acceptance; the underlying memory writer remains unidentified. It is a
+  local startup workaround, with no per-token synchronization.
+- **Memory sizing:** increase estimated runtime overhead to 16 GiB with MTP
+  (14 GiB without), use an 8 GiB BF16 KV target, and reduce concurrency and
+  prefill chunk size. PLE offload, host reserves and the watchdog remain active.
+  Spark-specific sysctl recommendations are suppressed on Thor.
+- **Validation and launch fixes:** add Thor profile/runner regressions, isolated
+  MoE and QSA checks, and a decode/acceptance benchmark; fix first launch with
+  an empty log archive. The smoke test supports an explicit speed threshold;
+  the current graph/MTP profile passes its normal 15 tokens/s floor.
+
+## Differences from the Spark profile
+
+These compare the Spark defaults retained in this checkout with the current
+`start-thor.sh` defaults, rather than any later upstream release.
+
+| Setting | Spark baseline | This AGX Thor fork |
+| --- | --- | --- |
+| Entry point | `./start.sh` | **`./start-thor.sh`** |
+| MoE backend | Automatic selection | Explicit Marlin fallback |
+| Concurrent sequences | 4 | 1 |
+| Prefill chunk size | 2,048 tokens | 1,024 tokens |
+| KV cache | FP8, 20 GiB target | BF16 (`auto`), 8 GiB target |
+| Estimated runtime overhead | 5.6 GiB | 16 GiB with MTP; 14 GiB without |
+| Context | 262,144, YaRN off | Same configured limit; full-length validation pending |
+| MTP / CUDA graphs | MTP 3, full decode graphs | MTP 3, full decode graphs with Thor runner fixes |
+
+KV targets feed the memory budget; the actual allocation depends on host
+reserves and vLLM profiling. Both profiles keep torch.compile disabled.
+For the original eager Thor fallback, use
+`MTP_NUM_SPECULATIVE_TOKENS=0 CUDAGRAPH_MODE=NONE ./start-thor.sh`.
+
+## Measured on AGX Thor
+
+On 2026-09-26, two fresh, uninstrumented startups with the default Thor profile
+measured **36.27–36.72 tokens/s for prose** and **59.02–59.47 tokens/s for code**.
+Each result is the median of three 400-token requests, temperature zero,
+thinking disabled, including prefill and HTTP overhead. With graphs enabled
+and MTP off, the same benchmark measured 28.35 tokens/s prose and 28.15 tokens/s
+code. The initial eager bring-up's ~6 tokens/s is historical.
+
+Both startups passed all eight smoke checks, including text, parsed tool calls
+and vision. Approximately 7.2k-token retrieval, cached follow-up and thinking
+budget checks also passed. A full 262,144-token prompt, video, multiple
+concurrent requests and long-duration serving have not been validated on Thor.
+See the [Thor measurements and reproduction commands](docs/thor.md#mtp-and-graph-validation-2026-09-26).
+Spark results below use different configurations and workloads and are not a
+head-to-head hardware comparison.
+
+## Inherited Spark reference
+
+The remaining sections preserve the original Spark measurements and shared
+feature documentation. References to “this host”, “shipped defaults” and
+Spark performance in those sections describe the upstream Spark setup.
+**For this fork, use the Thor profile and validation scope above.** Examples
+using `./start.sh` need `./start-thor.sh` on Thor; optional configurations and
+other checkpoints are not thereby validated on Thor. The systemd supervisor
+calls `start.sh` directly, so copy the Thor wrapper settings into `.env` before
+using supervised restarts, as described in the [Thor runbook](docs/thor.md#thor-profile).
 
 **Migration — the API binds to every interface again.** The API briefly
 defaulted to loopback (`127.0.0.1`); it now binds `0.0.0.0` by default
@@ -39,7 +136,7 @@ prints a WARN listing the exposed interfaces — anything that can reach the
 port can reach the model, so serve with a key or set `BIND=127.0.0.1` in
 `.env` and reach the box through an ssh tunnel.
 
-## Measured profile
+## Measured profile (historical DGX Spark results)
 
 `.env.sample` ships **262,144 context (YaRN off), MTP 3, `HOST_RESERVE_GIB=26`,
 `KV_TARGET_GIB=20`, `KV_CACHE_DTYPE=fp8`, `MAMBA_SSM_CACHE_DTYPE=bfloat16`,
@@ -1079,6 +1176,11 @@ set (the shipped default), set `API_KEY` in the shell first or the call 401s;
 
 ## Layout
 
+- `start-thor.sh` — AGX Thor entry point; applies the Thor profile to the shared launcher.
+- `docs/thor.md` and `docs/thor-port.md` — Thor runbook, validation and port history.
+- `files/patch_thor_runner.py` — Thor V2 runner dummy-input and startup fixes.
+- `scripts/check_thor.py`, `tests/test_thor_*.py` and `bench/thor-decode.py` —
+  Thor preflight, regressions and decode/acceptance measurements.
 - `download.sh` — fetches the checkpoint into the Hugging Face cache
   (resumable; honours `HF_TOKEN` for gated repos; sha256-verifies every LFS
   blob against the paginated HF tree manifest unless `VERIFY_SHA256=0`).
@@ -1192,7 +1294,7 @@ sparkDash's own figures include any other traffic on the port.
   `TP1_MODEL_ID`. Weights are unmodified NVIDIA output; the PLE-format and
   MTP quant_algo fixes above are this repository's own compatibility work,
   not a re-quantization.
-- **MiaAI Lab** — the single-DGX-Spark NVFP4 recipe and
+- **MiaAI Lab** — the [original single-DGX-Spark source and recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark), which this AGX Thor fork adapts, and
   [`Mia-AiLab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4).
 - **local-inference-lab** — the byte-identical Spark checkpoint used as the
   splice base.
